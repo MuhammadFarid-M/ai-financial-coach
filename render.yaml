@@ -1,0 +1,42 @@
+# Render Blueprint — deploys ONLY the FastAPI backend.
+# The database lives on Neon (free, longer-lived, scale-to-zero), so there is
+# no `databases:` block here — we just point DATABASE_URL at the Neon string.
+#
+# WHERE THIS GOES: the ROOT of your Git repo (the folder with backend/ + frontend/).
+# In Render: New + → Blueprint → select your repo.
+
+services:
+  - type: web
+    name: ai-financial-coach-api
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /
+    envVars:
+      # SECRET — paste your Neon connection string in the Render dashboard.
+      # Format: postgresql://USER:PASSWORD@HOST/DBNAME?sslmode=require
+      # config.py leaves postgresql:// untouched; sslmode passes to psycopg2.
+      - key: DATABASE_URL
+        sync: false
+      # Render generates a strong random secret for JWT signing.
+      - key: SECRET_KEY
+        generateValue: true
+      # SECRET — paste your OpenRouter key in the dashboard (never committed).
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: "meta-llama/llama-3.3-70b:free,openai/gpt-oss-120b:free,openrouter/free"
+      - key: OPENROUTER_JSON_MODE
+        value: "False"
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "1440"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # Fill in AFTER the frontend is live on Vercel (its URL, no trailing slash).
+      - key: CORS_ORIGINS
+        sync: false
