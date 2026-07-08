@@ -15,9 +15,12 @@ a warm "coach". Anything non-numeric falls through to plain advice.
 GRACEFUL DEGRADATION: no key, or any failure, falls back to a local response.
 """
 import json
+import os
 import re
+import time
 
 import httpx
+from dotenv import load_dotenv
 
 from app.calculators import (
     affordability,
@@ -31,6 +34,10 @@ from app.calculators import (
     tax_estimate_india,
 )
 from app.config import settings
+
+# Make .env values (e.g. GROQ_API_KEY) available locally; on Render this is a
+# harmless no-op since real env vars are already set and never overridden.
+load_dotenv()
 
 ALLOWED_TYPES = {
     "loan", "affordability", "sip", "lumpsum",
@@ -157,53 +164,80 @@ def _looks_like_refusal(text: str) -> bool:
     return bool(text) and bool(_REFUSAL_RE.search(text))
 
 
+def _providers():
+    """Ordered list of (provider, base_url, api_key, model) attempts.
+    Groq is PRIMARY — it's a separate provider with its own (larger) quota, faster
+    hardware, and far less of the free-pool congestion that plagues OpenRouter.
+    OpenRouter's free chain is the FALLBACK, and also covers the case where Groq's
+    single model is ever unavailable/retired."""
+    provs = []
+
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        groq_base = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
+        groq_models = [m.strip() for m in
+                       os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").split(",") if m.strip()]
+        for m in groq_models:
+            provs.append(("groq", groq_base, groq_key, m))
+
+    for m in _model_chain():
+        provs.append(("openrouter", settings.OPENROUTER_BASE_URL,
+                      settings.OPENROUTER_API_KEY, m))
+    return provs
+
+
+def _post_chat(base, key, provider, body):
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "http://localhost"
+        headers["X-Title"] = "AI Financial Workspace"
+    return httpx.post(f"{base}/chat/completions", headers=headers, json=body, timeout=45)
+
+
 def _call_openrouter(messages, json_mode=False, max_tokens=None, temperature=0.4) -> str:
-    """Try each model in the chain; skip rate-limited / unavailable / refusing ones.
-    Raises if every model fails, so the caller falls back to the offline budget."""
+    """Try each provider/model in order. On a 429 (congestion) retry the same one
+    once after a short pause, since the pool is often free a second later. Skip
+    anything that stays rate-limited / unavailable / refuses / is empty. Raises
+    only if EVERY provider fails, so the caller falls back to the offline budget."""
     last_err = None
-    for model in _model_chain():
+    for provider, base, key, model in _providers():
         body = {"model": model, "messages": messages, "temperature": temperature}
-        if json_mode and settings.OPENROUTER_JSON_MODE:
+        # JSON mode: keep OpenRouter gated by its flag; for Groq rely on the
+        # loose JSON parser instead (its reasoning models dislike response_format).
+        if json_mode and provider == "openrouter" and settings.OPENROUTER_JSON_MODE:
             body["response_format"] = {"type": "json_object"}
         if max_tokens:
             body["max_tokens"] = max_tokens
 
-        try:
-            resp = httpx.post(
-                f"{settings.OPENROUTER_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "http://localhost",
-                    "X-Title": "AI Financial Workspace",
-                },
-                json=body,
-                timeout=45,
-            )
-        except Exception as exc:  # network / timeout -> next model
-            last_err = exc
-            continue
+        for attempt in range(2):  # one retry on transient congestion
+            try:
+                resp = _post_chat(base, key, provider, body)
+            except Exception as exc:  # network / timeout -> next provider
+                last_err = exc
+                break
 
-        if resp.status_code != 200:  # 429 / 404 / 402 / 403 -> next model
-            last_err = RuntimeError(f"{model}: HTTP {resp.status_code} {resp.text[:180]}")
-            continue
+            if resp.status_code == 429 and attempt == 0:
+                time.sleep(2)  # "temporarily rate-limited, retry shortly"
+                continue
+            if resp.status_code != 200:  # still rate-limited / 404 / 402 -> next provider
+                last_err = RuntimeError(f"{provider}/{model}: HTTP {resp.status_code} {resp.text[:160]}")
+                break
 
-        try:
-            content = resp.json()["choices"][0]["message"]["content"]
-        except Exception as exc:
-            last_err = exc
-            continue
+            try:
+                content = resp.json()["choices"][0]["message"]["content"]
+            except Exception as exc:
+                last_err = exc
+                break
+            if _looks_like_refusal(content):
+                last_err = RuntimeError(f"{provider}/{model}: refused the request")
+                break
+            if not (content or "").strip():
+                last_err = RuntimeError(f"{provider}/{model}: empty response")
+                break
 
-        if _looks_like_refusal(content):  # model moderation wrapper -> next model
-            last_err = RuntimeError(f"{model}: refused the request")
-            continue
-        if not (content or "").strip():  # empty -> next model
-            last_err = RuntimeError(f"{model}: empty response")
-            continue
+            return content  # success
 
-        return content  # success
-
-    raise last_err or RuntimeError("All models in the chain failed")
+    raise last_err or RuntimeError("All providers failed")
 
 
 def _title_from_prompt(prompt: str) -> str:
