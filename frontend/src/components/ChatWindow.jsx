@@ -1,18 +1,39 @@
 import { useEffect, useRef, useState } from "react";
 import MessageBubble from "./MessageBubble";
 
-// The center column: title + welcome, the scrolling message body, and the
-// fixed prompt bar at the bottom.
+// Rotating "thinking" messages, shown one at a time, advancing every ~10s.
+// The last one acknowledges the free-tier cold start so a long wait feels normal.
+const THINKING_MSGS = [
+  "Thinking",
+  "Working on it",
+  "Just a moment",
+  "Almost there",
+  "Still working — the free server can take up to a minute",
+];
+
 export default function ChatWindow({ username, messages, onSend }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [thinkIdx, setThinkIdx] = useState(0);
   const bodyRef = useRef(null);
 
   // Keep the latest message in view.
   useEffect(() => {
     if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
-  }, [messages, sending]);
+  }, [messages, sending, thinkIdx]);
+
+  // Cycle the thinking message every 10s while waiting; reset when idle.
+  useEffect(() => {
+    if (!sending) {
+      setThinkIdx(0);
+      return;
+    }
+    const t = setInterval(() => {
+      setThinkIdx((i) => Math.min(i + 1, THINKING_MSGS.length - 1));
+    }, 10000);
+    return () => clearInterval(t);
+  }, [sending]);
 
   async function handleSend(e) {
     e.preventDefault();
@@ -56,7 +77,8 @@ export default function ChatWindow({ username, messages, onSend }) {
         {sending && (
           <div className="bubble ai pending">
             <span className="analyzing">
-              Analyzing<span className="dot">.</span>
+              {THINKING_MSGS[thinkIdx]}
+              <span className="dot">.</span>
               <span className="dot">.</span>
               <span className="dot">.</span>
             </span>
@@ -74,7 +96,7 @@ export default function ChatWindow({ username, messages, onSend }) {
           disabled={sending}
         />
         <button className="btn-primary send-btn" type="submit" disabled={sending}>
-          {sending ? "Analyzing..." : "Send"}
+          {sending ? "Sending..." : "Send"}
         </button>
       </form>
     </main>

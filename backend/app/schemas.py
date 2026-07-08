@@ -36,9 +36,9 @@ class AuthResponse(BaseModel):
 # --------------------------- Profile ----------------------------
 class ProfileRequest(BaseModel):
     user_id: uuid.UUID
-    monthly_income: float = 0
-    monthly_expenses: float = 0
-    current_savings: float = 0
+    monthly_income: float = Field(default=0, ge=0)
+    monthly_expenses: float = Field(default=0, ge=0)
+    current_savings: float = Field(default=0, ge=0)
     risk_tolerance: str = "Moderate"
 
 
@@ -78,7 +78,7 @@ class InsightResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
     id: uuid.UUID
-    session_id: uuid.UUID
+    session_id: Optional[uuid.UUID] = None
     user_prompt: str
     conversational_response: str
     chart_bool: bool

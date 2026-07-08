@@ -34,6 +34,10 @@ const mdComponents = {
 export default function MessageBubble({ message }) {
   const { user_prompt, conversational_response, chart_bool, chart_data } = message;
 
+  // A "pending" message (just submitted, awaiting the AI) shows only the
+  // user's prompt bubble; the thinking indicator renders separately below.
+  const pending = message.pending || conversational_response == null;
+
   const hasChart =
     chart_bool &&
     chart_data &&
@@ -45,22 +49,24 @@ export default function MessageBubble({ message }) {
     <>
       <div className="bubble user">{user_prompt}</div>
 
-      <div className="bubble ai">
-        <div className="markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-            {normalizeMarkdown(conversational_response)}
-          </ReactMarkdown>
-        </div>
-
-        {hasChart && (
-          <div className="chart-card">
-            <div className="chart-card-title">
-              {chart_data.title || "Allocation"}
-            </div>
-            <PieChart labels={chart_data.labels} values={chart_data.values} />
+      {!pending && (
+        <div className="bubble ai">
+          <div className="markdown">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              {normalizeMarkdown(conversational_response)}
+            </ReactMarkdown>
           </div>
-        )}
-      </div>
+
+          {hasChart && (
+            <div className="chart-card">
+              <div className="chart-card-title">
+                {chart_data.title || "Allocation"}
+              </div>
+              <PieChart labels={chart_data.labels} values={chart_data.values} />
+            </div>
+          )}
+        </div>
+      )}
     </>
   );
 }

@@ -101,13 +101,25 @@ Reply with a SINGLE valid JSON object and nothing else, in exactly this shape:
   "chart_data": {"title": "<what this breakdown represents>", "labels": ["..."], "values": [<number>, ...]} or null
 }
 
-Set "chart" to true with chart_data ONLY for budgeting/allocation/split questions.
+Set "chart" to true with chart_data whenever your answer shows money being SPLIT or
+ALLOCATED across two or more categories — this includes plans, budgets, suggestions,
+tax-saving plans, investment plans, savings plans, AND affordability/EMI/loan answers
+(show the resulting cash-flow split, e.g. Expenses / EMI / Remaining surplus). If the
+answer mentions where the user's money goes across categories, DRAW THE PIE.
 - By DEFAULT, break down the user's FULL monthly income — the values MUST sum to their monthly
   income — and set chart_data.title to "Income Allocation".
 - If you deliberately split only the surplus (or any other amount), set chart_data.title to
   describe exactly that, e.g. "Surplus Allocation" or "Down Payment Sources", so the chart is
   NEVER mislabelled. The values must always sum to whatever the title refers to.
-Otherwise chart=false, chart_data=null."""
+- For an EMI/affordability answer, a good default split is: Expenses, the new EMI, and the
+  Remaining surplus — summing to the monthly income.
+Only set chart=false, chart_data=null when the answer is a SINGLE number with no split at all
+(e.g. "what is the interest rate?") or a purely conceptual question ("what is a mutual fund?").
+
+FORMATTING OF THE CHART — CRITICAL:
+- The chart JSON goes ONLY in the "chart_data" field. NEVER paste chart JSON, a ```json block,
+  or any raw object into the "response" text. The "response" is human-readable Markdown only —
+  the user should never see raw JSON or code."""
 
 
 # --------------------------------------------------------------------------
@@ -128,7 +140,10 @@ def _loose_json(content):
     return None
 
 
-_REFUSAL_RE = re.compile(r"(user\s*safety\s*:\s*unsafe|safety\s*categories\s*:)", re.IGNORECASE)
+_REFUSAL_RE = re.compile(
+    r"(user\s*safety\s*:|safety\s*categories\s*:|^\s*(un)?safe\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _model_chain() -> list:
@@ -217,16 +232,18 @@ def _profile_block(income, expenses, savings, risk) -> str:
 # --------------------------------------------------------------------------
 # Pass 1 — extract intent
 # --------------------------------------------------------------------------
-def _extract_intent(prompt, income, expenses, savings, risk):
+def _extract_intent(prompt, income, expenses, savings, risk, history=None):
     user_msg = (
         f"Profile: income {fmt_inr(income)}/month, expenses {fmt_inr(expenses)}/month, "
         f"savings {fmt_inr(savings)}, risk {risk}.\nQuestion: {prompt}"
     )
+    messages = [{"role": "system", "content": EXTRACT_PROMPT}]
+    if history:
+        messages.extend(history)  # prior turns so references like "it" resolve
+    messages.append({"role": "user", "content": user_msg})
     try:
         content = _call_openrouter(
-            [{"role": "system", "content": EXTRACT_PROMPT},
-             {"role": "user", "content": user_msg}],
-            json_mode=True, max_tokens=300, temperature=0.0,
+            messages, json_mode=True, max_tokens=300, temperature=0.0,
         )
     except Exception:
         return None
@@ -402,7 +419,7 @@ def compute_facts(intent, income, expenses, savings, risk):
 # --------------------------------------------------------------------------
 # Pass 2 — explain
 # --------------------------------------------------------------------------
-def _explain(prompt, income, expenses, savings, risk, facts):
+def _explain(prompt, income, expenses, savings, risk, facts, history=None):
     parts = [
         "Use ONLY these exact figures — do not assume different amounts:",
         _profile_block(income, expenses, savings, risk),
@@ -415,31 +432,82 @@ def _explain(prompt, income, expenses, savings, risk, facts):
     parts.append(f"\nUser question: {prompt}")
     user_msg = "\n".join(parts)
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)  # prior conversation so follow-ups stay in context
+    messages.append({"role": "user", "content": user_msg})
+
     try:
-        content = _call_openrouter(
-            [{"role": "system", "content": SYSTEM_PROMPT},
-             {"role": "user", "content": user_msg}],
-            json_mode=True,
-        )
+        content = _call_openrouter(messages, json_mode=True)
         return _parse_ai_content(content, prompt)
     except Exception as exc:
         return _local_response(prompt, income, expenses, savings, risk, note=str(exc))
 
 
+_CHART_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+_CHART_BARE_RE = re.compile(r'\{[^{}]*"labels"[^{}]*"values"[^{}]*\}', re.DOTALL)
+
+
+def _valid_chart(obj):
+    """Return a chart_data dict if obj (or its .chart_data) has labels+values."""
+    if not isinstance(obj, dict):
+        return None
+    for cand in (obj, obj.get("chart_data")):
+        if (
+            isinstance(cand, dict)
+            and isinstance(cand.get("labels"), list)
+            and isinstance(cand.get("values"), list)
+        ):
+            return cand
+    return None
+
+
+def _extract_chart_from_text(text):
+    """Some models dump the chart JSON into the visible answer (as a ```json
+    block or a bare object) instead of the chart_data field. Pull it out and
+    strip it from the text so the user never sees raw code. Returns
+    (cleaned_text, chart_data_or_None)."""
+    if not text:
+        return text, None
+    for regex in (_CHART_FENCE_RE, _CHART_BARE_RE):
+        for m in regex.finditer(text):
+            block = m.group(1) if regex is _CHART_FENCE_RE else m.group(0)
+            try:
+                cd = _valid_chart(json.loads(block))
+            except Exception:
+                cd = None
+            if cd is not None:
+                cleaned = text.replace(m.group(0), "").strip()
+                return cleaned, cd
+    return text, None
+
+
 def _parse_ai_content(content, prompt):
     data = _loose_json(content)
     if not isinstance(data, dict):
+        # Not even outer JSON — still try to rescue an embedded chart.
+        text, salvaged = _extract_chart_from_text(content.strip())
+        if salvaged is not None:
+            if not salvaged.get("title"):
+                salvaged["title"] = "Income Allocation"
+            return text, True, salvaged, _title_from_prompt(prompt)
         return content.strip(), False, None, _title_from_prompt(prompt)
 
     text = (data.get("response") or "").strip() or content.strip()
     chart_bool = bool(data.get("chart", False))
     chart_data = data.get("chart_data") if chart_bool else None
-    if chart_data is not None and not (
-        isinstance(chart_data, dict)
-        and isinstance(chart_data.get("labels"), list)
-        and isinstance(chart_data.get("values"), list)
-    ):
+    if chart_data is not None and _valid_chart(chart_data) is None:
         chart_bool, chart_data = False, None
+
+    # SAFETY NET: if the real chart_data field is empty but the model dumped a
+    # chart into the response text, rescue it and strip the raw JSON from view.
+    if chart_data is None:
+        text, salvaged = _extract_chart_from_text(text)
+        if salvaged is not None:
+            chart_bool, chart_data = True, salvaged
+    else:
+        # chart is set correctly — still strip any duplicate JSON block from text.
+        text, _dup = _extract_chart_from_text(text)
 
     # Guarantee a chart title so the frontend never falls back to a wrong label.
     if chart_data is not None:
@@ -493,15 +561,69 @@ def _local_response(prompt, income, expenses, current_savings, risk, note=None):
 
 
 # --------------------------------------------------------------------------
+# Topic guardrail — this is a *financial* coach, so politely decline anything
+# with no money/finance signal. Keyword-based: fast, free, and errs toward
+# letting borderline questions through rather than wrongly rejecting them.
+# --------------------------------------------------------------------------
+_FINANCE_TERMS = {
+    "money", "cash", "rupee", "rupees", "inr", "rs", "lakh", "lakhs", "crore", "crores",
+    "salary", "salaried", "income", "earn", "earning", "earnings", "expense", "expenses",
+    "spend", "spending", "budget", "budgeting", "save", "saving", "savings",
+    "invest", "invests", "investing", "investment", "investments", "sip", "lumpsum",
+    "mutual", "fund", "funds", "stock", "stocks", "share", "shares", "equity",
+    "bond", "bonds", "loan", "loans", "emi", "emis", "interest", "debt", "debts",
+    "credit", "mortgage", "borrow", "borrowing", "rent", "renting", "lease",
+    "buy", "buying", "purchase", "afford", "affordable", "affordability",
+    "price", "priced", "cost", "costs", "car", "bike", "scooter", "home", "house",
+    "flat", "apartment", "property", "land", "plot", "tax", "taxes", "taxation",
+    "insurance", "premium", "retire", "retirement", "pension", "wealth", "finance",
+    "financial", "financially", "bank", "banking", "deposit", "deposits", "fd", "rd",
+    "portfolio", "installment", "installments", "gold", "crypto", "bitcoin",
+    "networth", "profit", "loss", "return", "returns", "inflation", "principal",
+    "tenure", "payment", "payments", "downpayment", "corpus", "goal", "goals",
+    "monthly", "annual", "annually", "salaries", "fees", "fee", "epf", "ppf", "nps",
+}
+
+
+def _is_finance_related(prompt: str) -> bool:
+    text = (prompt or "").lower()
+    if "₹" in text or "rs." in text or "$" in text:
+        return True
+    words = set(re.findall(r"[a-z]+", text))
+    return bool(words & _FINANCE_TERMS)
+
+
+def is_off_topic(prompt: str) -> bool:
+    """Public helper so the chat route can decide NOT to persist a thread."""
+    return not _is_finance_related(prompt)
+
+
+OFF_TOPIC_MESSAGE = (
+    "I'm your **financial coach**, so I can only help with money-related "
+    "questions — things like budgeting, saving, loans and EMIs, investments, "
+    "taxes, rent-vs-buy, or planning a big purchase. 💰\n\n"
+    "Try asking me something about your finances!"
+)
+
+
+def _off_topic_response(prompt):
+    return OFF_TOPIC_MESSAGE, False, None, "Off-topic question"
+
+
+# --------------------------------------------------------------------------
 # Public entrypoint — orchestrates the two passes
 # --------------------------------------------------------------------------
-def generate_strategy(prompt, income, expenses, current_savings, risk):
+def generate_strategy(prompt, income, expenses, current_savings, risk, history=None):
+    # Topic guardrail first — decline clearly non-financial questions.
+    if not _is_finance_related(prompt):
+        return _off_topic_response(prompt)
+
     # No key -> deterministic offline mode (also used for tests).
     if not settings.OPENROUTER_API_KEY:
         return _local_response(prompt, income, expenses, current_savings, risk)
 
     # Pass 1: extract intent (best-effort; None just means "no facts").
-    intent = _extract_intent(prompt, income, expenses, current_savings, risk)
+    intent = _extract_intent(prompt, income, expenses, current_savings, risk, history)
 
     facts = None
     if intent and intent["type"] != "general":
@@ -510,5 +632,5 @@ def generate_strategy(prompt, income, expenses, current_savings, risk):
         except Exception:
             facts = None
 
-    # Pass 2: explain using the computed facts.
-    return _explain(prompt, income, expenses, current_savings, risk, facts)
+    # Pass 2: explain using the computed facts + conversation history.
+    return _explain(prompt, income, expenses, current_savings, risk, facts, history)

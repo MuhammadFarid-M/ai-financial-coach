@@ -14,18 +14,57 @@ POST /api/chat does the real work:
 GET /history/{user_id}/sessions returns every session with its messages,
 chronologically — handy for exports or restoring full continuity.
 """
+import re
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app import models, schemas
-from app.ai_engine import generate_strategy
+from app.ai_engine import OFF_TOPIC_MESSAGE, generate_strategy, is_off_topic
 from app.database import get_db
 from app.routers.sessions import new_session
 from app.security import ensure_owner, get_current_user
 
 router = APIRouter(tags=["chat"])
+
+
+# Signals that mark a "key point" worth keeping from a past AI answer.
+_FACT_RE = re.compile(
+    r"[^.\n]*(?:₹|%|emi|feasible|afford|surplus|down\s*payment|loan|save|savings|goal|tenure)[^.\n]*",
+    re.IGNORECASE,
+)
+
+
+def _key_facts(text, max_chars=180, max_bits=3):
+    """Pull a few money/verdict fragments out of a past answer — no AI, just regex."""
+    bits, total = [], 0
+    for frag in _FACT_RE.findall(text or ""):
+        frag = frag.replace("**", "").strip(" -*#\t")
+        if not frag:
+            continue
+        if len(frag) > 90:
+            frag = frag[:90] + "…"
+        bits.append(frag)
+        total += len(frag)
+        if len(bits) >= max_bits or total >= max_chars:
+            break
+    return "; ".join(bits)
+
+
+def _summarize_exchanges(insights):
+    """Compress the last exchanges into a short context block (cheap, no AI call)."""
+    lines = []
+    for ins in insights:  # oldest -> newest
+        q = (ins.user_prompt or "").strip().replace("\n", " ")
+        if len(q) > 160:
+            q = q[:160] + "…"
+        lines.append(f"- You asked: {q}")
+        facts = _key_facts(ins.conversational_response or "")
+        if facts:
+            lines.append(f"  Key points: {facts}")
+    return "\n".join(lines)[:600]  # hard cap so requests stay lean
 
 
 @router.post("/api/chat", response_model=schemas.InsightResponse)
@@ -51,6 +90,21 @@ def chat(
         if existing_session is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
+    # Off-topic + a BRAND-NEW thread: reply with the refusal but create and
+    # save nothing — the sidebar should only ever hold real financial threads.
+    # (Off-topic inside an existing thread still saves, to keep that
+    # conversation's continuity.)
+    if existing_session is None and is_off_topic(payload.prompt):
+        return schemas.InsightResponse(
+            id=uuid.uuid4(),
+            session_id=None,
+            user_prompt=payload.prompt,
+            conversational_response=OFF_TOPIC_MESSAGE,
+            chart_bool=False,
+            chart_data=None,
+            created_at=datetime.now(timezone.utc),
+        )
+
     # The AI's financial context comes from the saved profile — never from the
     # request body. This keeps the numbers authoritative and unspoofable.
     profile = (
@@ -64,12 +118,36 @@ def chat(
             detail="No financial profile found. Save your profile before chatting.",
         )
 
+    # Conversation memory: summarize the last 2 exchanges of THIS thread into
+    # ONE compact context block (cheap code extraction, no AI call) so follow-ups
+    # stay in context while keeping requests small and free-tier-friendly.
+    history = []
+    if existing_session is not None:
+        recent = (
+            db.query(models.Insight)
+            .filter(models.Insight.session_id == existing_session.id)
+            .order_by(models.Insight.created_at.desc())
+            .limit(2)
+            .all()
+        )
+        if recent:
+            summary = _summarize_exchanges(list(reversed(recent)))
+            if summary.strip():
+                history = [{
+                    "role": "user",
+                    "content": (
+                        "Context from earlier in this conversation (use it to keep "
+                        "continuity, then answer the new question):\n" + summary
+                    ),
+                }]
+
     text, chart_bool, chart_data, title = generate_strategy(
         payload.prompt,
         float(profile.monthly_income),
         float(profile.monthly_expenses),
         float(profile.current_savings),
         profile.risk_tolerance,
+        history=history,
     )
 
     # New thread? Name it from the AI's title. Existing thread keeps its name.

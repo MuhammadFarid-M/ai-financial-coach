@@ -18,8 +18,11 @@ async function request(path, { method = "GET", body, auth = true } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // Token expired or invalid -> wipe it and bounce back to the auth screen.
-  if (res.status === 401) {
+  // A 401 on an AUTHENTICATED request means the token expired/invalid -> wipe
+  // it and bounce to the auth screen. On a PUBLIC request (login/signup) a 401
+  // just means bad credentials, so let it fall through to the normal handler
+  // below and show the backend's real message ("Incorrect email or password").
+  if (res.status === 401 && auth) {
     clearAuth();
     window.location.reload();
     throw new Error("Your session expired. Please sign in again.");

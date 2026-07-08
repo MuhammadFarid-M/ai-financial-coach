@@ -63,6 +63,17 @@ export default function FinancialCoach({ auth, onLogout }) {
   async function handleSaveProfile(e) {
     e.preventDefault();
     setProfileError("");
+
+    // Reject negative numbers before saving.
+    if (
+      Number(profile.monthly_income) < 0 ||
+      Number(profile.monthly_expenses) < 0 ||
+      Number(profile.current_savings) < 0
+    ) {
+      setProfileError("Please fix the highlighted fields — values can't be negative.");
+      return;
+    }
+
     setSavingProfile(true);
     try {
       await api.saveProfile({
@@ -107,20 +118,34 @@ export default function FinancialCoach({ auth, onLogout }) {
     }
   }
 
-  // Sends one prompt. If activeSessionId is null, the backend creates the
-  // thread and returns its id, which we then adopt and add to the sidebar.
+  // Sends one prompt. The user's message is shown IMMEDIATELY (optimistic),
+  // then replaced with the full exchange once the backend responds. If
+  // activeSessionId is null, the backend creates the thread and returns its id.
   async function sendMessage(prompt) {
-    const res = await api.chat({
-      user_id: auth.user_id,
-      session_id: activeSessionId,
-      prompt,
-    });
-    setMessages((prev) => [...prev, res]);
+    const tempId = "temp-" + Date.now();
+    setMessages((prev) => [
+      ...prev,
+      { id: tempId, user_prompt: prompt, conversational_response: null, pending: true },
+    ]);
 
-    if (res.session_id !== activeSessionId) {
-      setActiveSessionId(res.session_id);
-      const fresh = await api.listSessions(auth.user_id);
-      setSessions(fresh);
+    try {
+      const res = await api.chat({
+        user_id: auth.user_id,
+        session_id: activeSessionId,
+        prompt,
+      });
+      // Swap the optimistic placeholder for the real message.
+      setMessages((prev) => prev.map((m) => (m.id === tempId ? res : m)));
+
+      if (res.session_id !== activeSessionId) {
+        setActiveSessionId(res.session_id);
+        const fresh = await api.listSessions(auth.user_id);
+        setSessions(fresh);
+      }
+    } catch (err) {
+      // Roll back the optimistic message and let ChatWindow surface the error.
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+      throw err;
     }
   }
 
@@ -130,6 +155,12 @@ export default function FinancialCoach({ auth, onLogout }) {
 
   // ---------- STEP 1: profile setup ----------
   if (step === 1) {
+    const neg = (v) => v !== "" && Number(v) < 0;
+    const negErrors = {
+      monthly_income: neg(profile.monthly_income),
+      monthly_expenses: neg(profile.monthly_expenses),
+      current_savings: neg(profile.current_savings),
+    };
     return (
       <div className="setup-wrap">
         <form className="setup-card" onSubmit={handleSaveProfile}>
@@ -149,6 +180,9 @@ export default function FinancialCoach({ auth, onLogout }) {
             onChange={(e) => setProfile({ ...profile, monthly_income: e.target.value })}
             required
           />
+          {negErrors.monthly_income && (
+            <div className="field-hint-error">Invalid — value can’t be negative</div>
+          )}
 
           <label className="field-label" htmlFor="expenses">
             Monthly Expenses / Essential Needs (INR)
@@ -163,6 +197,9 @@ export default function FinancialCoach({ auth, onLogout }) {
             onChange={(e) => setProfile({ ...profile, monthly_expenses: e.target.value })}
             required
           />
+          {negErrors.monthly_expenses && (
+            <div className="field-hint-error">Invalid — value can’t be negative</div>
+          )}
 
           <label className="field-label" htmlFor="savings">Current Savings (INR)</label>
           <input
@@ -175,6 +212,9 @@ export default function FinancialCoach({ auth, onLogout }) {
             onChange={(e) => setProfile({ ...profile, current_savings: e.target.value })}
             required
           />
+          {negErrors.current_savings && (
+            <div className="field-hint-error">Invalid — value can’t be negative</div>
+          )}
 
           <label className="field-label" htmlFor="risk">Risk Tolerance</label>
           <select
